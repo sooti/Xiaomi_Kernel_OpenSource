@@ -26,6 +26,11 @@ smb1396: qcom,smb1396@34 {
 	qcom,periph-map = <0x06 0x26 0x27>;
 	status = "disabled";
 
+	smb1396_revid: qcom,revid {
+		compatible = "qcom,qpnp-revid";
+		reg = <0x100>;
+	};
+
 	smb1396_div2_cp_master: qcom,div2_cp {
 		compatible = "qcom,smb1396-div2-cp-master";
 		interrupt-parent = <&smb1396>;

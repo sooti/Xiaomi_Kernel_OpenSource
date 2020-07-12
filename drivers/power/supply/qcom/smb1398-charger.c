@@ -4,6 +4,7 @@
  * Copyright (C) 2020 XiaoMi, Inc.
  */
 #define DEBUG
+
 #define pr_fmt(fmt) "SMB1398: %s: " fmt, __func__
 
 #include <linux/device.h>
@@ -14,6 +15,7 @@
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
 #include <linux/pmic-voter.h>
+#include <linux/qpnp/qpnp-revid.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
 #include <linux/iio/consumer.h>
@@ -73,6 +75,9 @@
 #define DIV2_IN_ILIM			BIT(0)
 
 /* Config register definition */
+#define PERPH0_MISC_CFG2_REG		0x2636
+#define CFG_TEMP_PIN_ITEMP		BIT(1)
+
 #define MISC_USB_WLS_SUSPEND_REG	0x2630
 #define WLS_SUSPEND			BIT(1)
 #define USB_SUSPEND			BIT(0)
@@ -82,6 +87,7 @@
 #define EN_SWITCHER			BIT(0)
 
 #define MISC_DIV2_3LVL_CTRL_REG		0x2632
+#define MISC_DIV2_3LVL_CTRL_MASK	GENMASK(7, 0)
 #define EN_DIV2_CP			BIT(2)
 #define EN_3LVL_BULK			BIT(1)
 #define EN_CHG_2X			BIT(0)
@@ -91,6 +97,7 @@
 #define SW_EN_SWITCHER_BIT		BIT(3)
 
 #define MISC_CFG1_REG			0x2635
+#define MISC_CFG1_MASK			GENMASK(7, 0)
 #define CFG_OP_MODE_MASK		GENMASK(2, 0)
 #define OP_MODE_DISABLED		0
 #define OP_MODE_3LVL_BULK		1
@@ -171,6 +178,9 @@
 #define IIN_SS_DAC_VALUE_MASK		GENMASK(6, 0)
 #define IIN_STEP_MA			50
 
+#define PERPH0_DIV2_REF_CFG		0x2671
+#define CFG_IREV_REF_BIT		BIT(2)
+
 #define PERPH0_CFG_SDCDC_REG		0x267A
 #define EN_WIN_UV_BIT			BIT(7)
 
@@ -204,16 +214,19 @@
 #define CC_MODE_VOTER			"CC_MODE_VOTER"
 #define MAIN_DISABLE_VOTER		"MAIN_DISABLE_VOTER"
 #define MAIN_FCC_VOTER                  "MAIN_FCC_VOTER"
+#define TAPER_MAIN_ICL_LIMIT_VOTER	"TAPER_MAIN_ICL_LIMIT_VOTER"
 
 /* Constant definitions */
 /* Need to define max ILIM for smb1398 */
 #define DIV2_MAX_ILIM_UA		5000000
 #define DIV2_MAX_ILIM_DUAL_CP_UA	10000000
+#define DIV2_ILIM_CFG_PCT		105
 
 #define TAPER_STEPPER_UA_DEFAULT	100000
 #define TAPER_STEPPER_UA_IN_CC_MODE	200000
 #define TAPER_STEPPER_UA_SIX_PIN	20000
 #define TAPER_IBAT_OFFSET_UA            1300000
+#define CC_MODE_TAPER_MAIN_ICL_UA	500000
 
 #define MAX_IOUT_UA			6300000
 #define MAX_1S_VOUT_UV			11700000
@@ -270,9 +283,12 @@ struct smb_irq {
 	int			shift;
 };
 
+static const struct smb_irq smb_irqs[];
+
 struct smb1398_chip {
 	struct device		*dev;
 	struct regmap		*regmap;
+	struct pmic_revid_data	*pmic_rev_id;
 
 	struct wakeup_source	*ws;
 	struct iio_channel	*die_temp_chan;
@@ -311,6 +327,8 @@ struct smb1398_chip {
 	int			taper_entry_fv;
 	int			div2_irq_status;
 	u32			div2_cp_role;
+	u32			pl_output_mode;
+	u32			pl_input_mode;
 	enum isns_mode		current_capability;
 
 	bool			status_change_running;
@@ -320,8 +338,7 @@ struct smb1398_chip {
 	bool			switcher_en;
 	bool			slave_en;
 	bool			in_suspend;
-	bool			six_pin_batt;
-	bool			qc3p5_ffc_batt;
+	bool			disabled;
 };
 
 static const struct smb_irq smb_irqs[];
@@ -332,7 +349,7 @@ static int smb1398_read(struct smb1398_chip *chip, u16 reg, u8 *val)
 
 	rc = regmap_read(chip->regmap, reg, &value);
 	if (rc < 0)
-		dev_err(chip->dev, "Read register 0x%x failed, rc=%d\n",
+		dev_err(chip->dev, "Couldn't read register 0x%x, rc=%d\n",
 				reg, rc);
 	else
 		*val = (u8)value;
@@ -347,7 +364,7 @@ static int smb1398_masked_write(struct smb1398_chip *chip,
 
 	rc = regmap_update_bits(chip->regmap, reg, mask, val);
 	if (rc < 0)
-		dev_err(chip->dev, "Update register 0x%x to 0x%x with mask 0x%x failed, rc=%d\n",
+		dev_err(chip->dev, "Couldn't update register 0x%x to 0x%x with mask 0x%x, rc=%d\n",
 				reg, val, mask, rc);
 
 	return rc;
@@ -634,12 +651,119 @@ static int smb1398_get_die_temp(struct smb1398_chip *chip, int *temp)
 	rc = iio_read_channel_processed(chip->die_temp_chan, &die_temp_deciC);
 	mutex_unlock(&chip->die_chan_lock);
 	if (rc < 0) {
-		dev_err(chip->dev, "read die_temp_chan failed, rc=%d\n", rc);
+		dev_err(chip->dev, "Couldn't read die_temp_chan, rc=%d\n", rc);
 	} else {
 		*temp = die_temp_deciC / 100;
-		dev_dbg(chip->dev, "get die temp %d\n", *temp);
+		dev_dbg(chip->dev, "die temp %d\n", *temp);
 	}
 
+	return rc;
+}
+
+static int smb1398_div2_cp_get_status1(
+		struct smb1398_chip *chip, u8 *status)
+{
+	int rc = 0;
+	u8 val;
+	bool ilim, win_uv, win_ov;
+
+	rc = smb1398_read(chip, PERPH1_INT_RT_STS_REG, &val);
+	if (rc < 0)
+		return rc;
+
+	win_uv = !!(val & DIV2_WIN_UV_STS);
+	win_ov = !!(val & DIV2_WIN_OV_STS);
+	ilim = !!(val & DIV2_ILIM_STS);
+	*status = ilim << 5 | win_uv << 1 | win_ov;
+
+	dev_dbg(chip->dev, "status1 = 0x%x\n", *status);
+	return rc;
+}
+
+static int smb1398_div2_cp_get_status2(
+		struct smb1398_chip *chip, u8 *status)
+{
+	int rc = 0;
+	u8 val;
+	bool smb_en, vin_ov, vin_uv, irev, tsd, switcher_off;
+
+	rc = smb1398_read(chip, MODE_STATUS_REG, &val);
+	if (rc < 0)
+		return rc;
+
+	smb_en = !!(val & SMB_EN);
+	switcher_off = !(val & PRE_EN_DCDC);
+
+	rc = smb1398_read(chip, PERPH1_INT_RT_STS_REG, &val);
+	if (rc < 0)
+		return rc;
+
+	switcher_off = !(val & DIV2_CFLY_SS_DONE_STS) && switcher_off;
+
+	rc = smb1398_read(chip, SWITCHER_OFF_VIN_STATUS_REG, &val);
+	if (rc < 0)
+		return rc;
+
+	vin_ov = !!(val & USB_IN_OVLO);
+	vin_uv = !!(val & USB_IN_UVLO);
+
+	rc = smb1398_read(chip, SWITCHER_OFF_FAULT_REG, &val);
+	if (rc < 0)
+		return rc;
+
+	irev = !!(val & DIV2_IREV_LATCH);
+	tsd = !!(val & TEMP_SHDWN);
+
+	*status = smb_en << 7 | vin_ov << 6 | vin_uv << 5
+		| irev << 3 | tsd << 2 | switcher_off;
+
+	dev_dbg(chip->dev, "status2 = 0x%x\n", *status);
+	return rc;
+	}
+}
+
+static int smb1398_div2_cp_get_irq_status(
+		struct smb1398_chip *chip, u8 *status)
+{
+	int rc = 0;
+	u8 val;
+	bool ilim, irev, tsd, off_vin, off_win;
+
+	rc = smb1398_read(chip, PERPH1_INT_RT_STS_REG, &val);
+	if (rc < 0)
+		return rc;
+
+	ilim = !!(val & DIV2_ILIM_STS);
+	off_win = !!(val & (DIV2_WIN_OV_STS | DIV2_WIN_UV_STS));
+
+	rc = smb1398_read(chip, PERPH0_INT_RT_STS_REG, &val);
+	if (rc < 0)
+		return rc;
+
+	irev = !!(val & DIV2_IREV_LATCH_STS);
+	tsd = !!(val & TEMP_SHUTDOWN_STS);
+	off_vin = !!(val & (USB_IN_OVLO_STS | USB_IN_UVLO_STS));
+
+	*status = ilim << 6 | irev << 3 | tsd << 2 | off_vin << 1 | off_win;
+
+	dev_dbg(chip->dev, "irq_status = 0x%x\n", *status);
+	return rc;
+}
+
+static int smb1398_div2_cp_switcher_en(struct smb1398_chip *chip, bool en)
+{
+	int rc;
+
+	rc = smb1398_masked_write(chip, MISC_SL_SWITCH_EN_REG,
+			EN_SWITCHER, en ? EN_SWITCHER : 0);
+	if (rc < 0) {
+		dev_err(chip->dev, "Couldn't write SWITCH_EN_REG, rc=%d\n", rc);
+		return rc;
+	}
+
+	chip->switcher_en = en;
+
+	dev_dbg(chip->dev, "%s switcher\n", en ? "enable" : "disable");
 	return rc;
 }
 
@@ -669,7 +793,7 @@ static int smb1398_div2_cp_isns_mode_control(
 	rc = smb1398_masked_write(chip, SSUPLY_TEMP_CTRL_REG,
 			SEL_OUT_TEMP_MAX_MASK, mux_sel);
 	if (rc < 0) {
-		dev_err(chip->dev, "set SSUPLY_TEMP_CTRL_REG failed, rc=%d\n",
+		dev_err(chip->dev, "Couldn't set SSUPLY_TEMP_CTRL_REG, rc=%d\n",
 				rc);
 		return rc;
 	}
@@ -677,7 +801,7 @@ static int smb1398_div2_cp_isns_mode_control(
 	rc = smb1398_masked_write(chip, PERPH0_MISC_CFG2_REG,
 			CFG_TEMP_PIN_ITEMP, 0);
 	if (rc < 0) {
-		dev_err(chip->dev, "set PERPH0_MISC_CFG2_REG failed, rc=%d\n",
+		dev_err(chip->dev, "Couldn't set PERPH0_MISC_CFG2_REG, rc=%d\n",
 				rc);
 		return rc;
 	}
